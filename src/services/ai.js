@@ -1,7 +1,17 @@
 const OpenAI = require('openai');
 const { supabase } = require('../config/supabase');
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// Lazy-initialize so missing key doesn't crash on startup
+let _openai = null;
+function getOpenAI() {
+  if (!process.env.OPENAI_API_KEY) {
+    const err = new Error('OPENAI_API_KEY is not configured');
+    err.status = 503;
+    throw err;
+  }
+  if (!_openai) _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  return _openai;
+}
 
 // Monthly quota per plan
 const PLAN_QUOTAS = {
@@ -98,7 +108,7 @@ const SYSTEM_PROMPT = `אתה מזכירה AI של Flow – פלטפורמת נ�
 async function chat(orgId, userId, messages) {
   await enforceQuota(orgId);
 
-  const response = await openai.chat.completions.create({
+  const response = await getOpenAI().chat.completions.create({
     model: 'gpt-4o-mini',
     messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...messages],
     max_tokens: 1024,
@@ -131,7 +141,7 @@ ${history}
 
 הצע תשובה מקצועית וחמה בשם העסק. תשובה קצרה ורלוונטית בלבד.`;
 
-  const response = await openai.chat.completions.create({
+  const response = await getOpenAI().chat.completions.create({
     model: 'gpt-4o-mini',
     messages: [
       { role: 'system', content: SYSTEM_PROMPT },
@@ -161,7 +171,7 @@ async function transcribe(orgId, userId, audioBuffer, mimeType) {
   const ext = mimeType?.split('/')[1]?.split(';')[0] || 'ogg';
   const file = new File([audioBuffer], `audio.${ext}`, { type: mimeType || 'audio/ogg' });
 
-  const response = await openai.audio.transcriptions.create({
+  const response = await getOpenAI().audio.transcriptions.create({
     model: 'whisper-1',
     file,
     language: 'he'  // Hebrew-first, fallback to auto-detect
@@ -195,7 +205,7 @@ ${history}
 
 כתוב תשובה אוטומטית קצרה, מקצועית וחמה. אל תחרוג מ-3 משפטים.`;
 
-  const response = await openai.chat.completions.create({
+  const response = await getOpenAI().chat.completions.create({
     model: 'gpt-4o-mini',
     messages: [
       { role: 'system', content: systemPrompt },
