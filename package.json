@@ -1,0 +1,36 @@
+{
+  "name": "flow-backend",
+  "version": "1.0.0",
+  "description": "",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LordKuba/flow.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/LordKuba/flow/issues"
+  },
+  "homepage": "https://github.com/LordKuba/flow#readme",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.101.0",
+    "cors": "^2.8.6",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.3.2",
+    "googleapis": "^171.4.0",
+    "helmet": "^8.1.0",
+    "multer": "^2.1.1",
+    "openai": "^6.33.0",
+    "pg": "^8.20.0",
+    "qrcode": "^1.5.4",
+    "whatsapp-web.js": "^1.34.6"
+  }
+}
