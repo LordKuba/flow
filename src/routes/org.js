@@ -50,7 +50,7 @@ router.get('/team', requireRole('manager'), async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('users')
-      .select('id, full_name, email, role, created_at')
+      .select('id, name, email, role, created_at')
       .eq('organization_id', req.user.organization_id)
       .order('created_at', { ascending: true });
 
