@@ -303,4 +303,22 @@ router.get('/me', authenticateUser, async (req, res) => {
   }
 });
 
+// POST /api/auth/forgot-password — send reset email via Supabase
+router.post('/forgot-password', async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'נדרש כתובת מייל' });
+
+  try {
+    const { error } = await supabaseAuth.auth.resetPasswordForEmail(email, {
+      redirectTo: `${process.env.FRONTEND_URL}/reset-password`
+    });
+    // Always return success to avoid email enumeration
+    if (error) console.error('Reset password error:', error.message);
+    res.json({ message: 'אם המייל קיים במערכת, ישלח אליו קישור לאיפוס סיסמא' });
+  } catch (err) {
+    console.error('Forgot password error:', err);
+    res.status(500).json({ error: 'שגיאה בשליחת המייל' });
+  }
+});
+
 module.exports = router;
