@@ -85,8 +85,11 @@ router.post('/whatsapp/qr', requireRole('main'), async (req, res) => {
       ...result
     });
   } catch (err) {
-    console.error('WhatsApp QR error:', err);
-    res.status(500).json({ error: 'Failed to start WhatsApp connection' });
+    console.error('WhatsApp QR error:', err.message || err);
+    res.status(500).json({
+      error: 'Failed to start WhatsApp connection',
+      detail: err.message || String(err)
+    });
   }
 });
 

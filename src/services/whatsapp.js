@@ -7,6 +7,10 @@ const { notifyNewMessage } = require('./notifications');
 // In-memory store of active WhatsApp sessions per organization
 const sessions = new Map();
 
+// Railway uses ephemeral filesystem — LocalAuth sessions are lost on every deploy.
+// This is expected; users will need to re-scan QR after deploys.
+const IS_RAILWAY = !!process.env.RAILWAY_ENVIRONMENT_NAME;
+
 function getSession(orgId) {
   return sessions.get(orgId) || null;
 }
@@ -38,13 +42,21 @@ async function initSession(orgId, channelId) {
   sessions.set(orgId, sessionState);
 
   const puppeteerConfig = {
-    headless: true,
+    headless: 'new',
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-gpu',
-      '--single-process'
+      '--disable-extensions',
+      '--disable-software-rasterizer',
+      '--disable-features=VizDisplayCompositor',
+      '--no-zygote',
+      '--no-first-run',
+      '--disable-background-networking',
+      '--disable-default-apps',
+      '--disable-translate',
+      '--js-flags=--max-old-space-size=256'
     ]
   };
   if (process.env.PUPPETEER_EXECUTABLE_PATH) {
@@ -129,27 +141,33 @@ async function initSession(orgId, channelId) {
     });
 
     // Initialize
+    console.log(`WhatsApp initializing for org ${orgId} (Chromium: ${puppeteerConfig.executablePath || 'bundled'})`);
     client.initialize().catch((err) => {
-      console.error(`WhatsApp init error for org ${orgId}:`, err);
+      console.error(`WhatsApp init error for org ${orgId}:`, err.message || err);
       sessionState.status = 'error';
+      sessionState.errorMessage = err.message || String(err);
       sessions.delete(orgId);
       if (!qrResolved) {
-        reject(err);
+        qrResolved = true;
+        reject(new Error(`WhatsApp initialization failed: ${err.message || err}`));
       }
     });
 
-    // Timeout if no QR received in 30 seconds
+    // Timeout if no QR received in 60 seconds (Chromium startup can be slow on Railway)
     setTimeout(() => {
       if (!qrResolved) {
         // Check if we got authenticated from saved session (no QR needed)
         if (sessionState.status === 'ready') {
           resolve({ status: 'already_connected' });
+        } else if (sessionState.status === 'error') {
+          qrResolved = true;
+          reject(new Error(`WhatsApp session failed: ${sessionState.errorMessage || 'unknown error'}`));
         } else {
           qrResolved = true;
           resolve({ status: 'initializing', message: 'Session starting, check status endpoint' });
         }
       }
-    }, 30000);
+    }, 60000);
   });
 }
 

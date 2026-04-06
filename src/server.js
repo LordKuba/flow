@@ -104,6 +104,25 @@ app.get('/health', async (req, res) => {
   });
 });
 
+// WhatsApp/Chromium diagnostic — check if Puppeteer can launch
+app.get('/health/whatsapp', async (req, res) => {
+  const execPath = process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium';
+  try {
+    // Use puppeteer bundled with whatsapp-web.js
+    const puppeteer = require('puppeteer');
+    const browser = await puppeteer.launch({
+      headless: 'new',
+      executablePath: execPath,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--no-zygote']
+    });
+    const version = await browser.version();
+    await browser.close();
+    res.json({ status: 'ok', chromium: version, executablePath: execPath });
+  } catch (err) {
+    res.status(500).json({ status: 'error', error: err.message, executablePath: execPath });
+  }
+});
+
 // 404 handler
 app.use((req, res) => {
   res.status(404).json({ error: 'Route not found' });
