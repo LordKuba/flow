@@ -3,13 +3,10 @@ const qrcode = require('qrcode');
 const { supabase } = require('../config/supabase');
 const { broadcastNewMessage } = require('./realtime');
 const { notifyNewMessage } = require('./notifications');
+const { saveSession, restoreSession, clearSession } = require('./sessionStore');
 
 // In-memory store of active WhatsApp sessions per organization
 const sessions = new Map();
-
-// Railway uses ephemeral filesystem — LocalAuth sessions are lost on every deploy.
-// This is expected; users will need to re-scan QR after deploys.
-const IS_RAILWAY = !!process.env.RAILWAY_ENVIRONMENT_NAME;
 
 function getSession(orgId) {
   return sessions.get(orgId) || null;
@@ -63,6 +60,12 @@ async function initSession(orgId, channelId) {
     puppeteerConfig.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
   }
 
+  // Restore session from Supabase before Chromium starts (so LocalAuth finds saved data)
+  const restored = await restoreSession(orgId, channelId);
+  if (restored) {
+    console.log(`Restored WhatsApp session from Supabase for org ${orgId}`);
+  }
+
   const client = new Client({
     authStrategy: new LocalAuth({ clientId: `org_${orgId}` }),
     puppeteer: puppeteerConfig
@@ -109,6 +112,11 @@ async function initSession(orgId, channelId) {
           account_name: info?.pushname || null
         })
         .eq('id', channelId);
+
+      // Persist session to Supabase so it survives deploys
+      saveSession(orgId, channelId).catch(err => {
+        console.error(`Failed to persist session for org ${orgId}:`, err.message);
+      });
     });
 
     // Incoming message handler
@@ -116,7 +124,7 @@ async function initSession(orgId, channelId) {
       await handleIncomingMessage(orgId, channelId, msg);
     });
 
-    // Auth failure
+    // Auth failure — clear stale session so next attempt gets a fresh QR
     client.on('auth_failure', async (err) => {
       console.error(`WhatsApp auth failed for org ${orgId}:`, err);
       sessionState.status = 'error';
@@ -125,6 +133,17 @@ async function initSession(orgId, channelId) {
         .from('channels')
         .update({ status: 'error' })
         .eq('id', channelId);
+
+      // Clear persisted session — it's expired/invalid
+      clearSession(orgId, channelId).catch(e => {
+        console.error(`Failed to clear session for org ${orgId}:`, e.message);
+      });
+
+      // Delete local auth dir so LocalAuth starts fresh
+      const fs = require('fs');
+      const path = require('path');
+      const authDir = path.join(process.cwd(), '.wwebjs_auth', `session-org_${orgId}`);
+      fs.rm(authDir, { recursive: true, force: true }, () => {});
     });
 
     // Disconnected
@@ -340,6 +359,8 @@ async function sendMessage(orgId, phone, content, mediaUrl) {
  */
 async function destroySession(orgId) {
   const session = sessions.get(orgId);
+  const channelId = session?.channelId;
+
   if (session?.client) {
     try {
       await session.client.destroy();
@@ -347,6 +368,14 @@ async function destroySession(orgId) {
       console.error('Destroy session error:', err);
     }
   }
+
+  // Clear persisted session from Supabase
+  if (channelId) {
+    clearSession(orgId, channelId).catch(err => {
+      console.error(`Failed to clear session for org ${orgId}:`, err.message);
+    });
+  }
+
   sessions.delete(orgId);
 }
 
