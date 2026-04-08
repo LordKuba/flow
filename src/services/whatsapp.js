@@ -361,6 +361,18 @@ async function importExistingChats(client, orgId, channelId) {
     // Read chat list directly from WhatsApp's internal store
     console.log(`Reading chat store for org ${orgId}...`);
 
+    // Debug: check what's available on window
+    const debugInfo = await client.pupPage.evaluate(() => {
+      return {
+        hasStore: !!window.Store,
+        storeKeys: window.Store ? Object.keys(window.Store).slice(0, 20) : [],
+        hasWWebJS: !!window.WWebJS,
+        hasMStore: !!window.mR,
+        hasRequire: typeof window.require === 'function'
+      };
+    });
+    console.log(`Store debug for org ${orgId}:`, JSON.stringify(debugInfo));
+
     // Wait for Store.Chat to be available (Puppeteer waitForFunction, max 30s)
     let storeReady = false;
     try {
