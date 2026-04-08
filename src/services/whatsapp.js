@@ -117,6 +117,11 @@ async function initSession(orgId, channelId) {
       saveSession(orgId, channelId).catch(err => {
         console.error(`Failed to persist session for org ${orgId}:`, err.message);
       });
+
+      // Import existing chats so the Inbox isn't empty after connecting
+      importExistingChats(client, orgId, channelId).catch(err => {
+        console.error(`Chat import failed for org ${orgId}:`, err.message);
+      });
     });
 
     // Incoming message handler
@@ -332,6 +337,158 @@ async function handleIncomingMessage(orgId, channelId, msg) {
   } catch (err) {
     console.error('Handle incoming message error:', err);
   }
+}
+
+/**
+ * Import existing WhatsApp chats after QR scan so the Inbox isn't empty.
+ * Fetches up to 50 recent 1:1 chats and their last 15 messages each.
+ */
+async function importExistingChats(client, orgId, channelId) {
+  const MAX_CHATS = 50;
+  const MSGS_PER_CHAT = 15;
+
+  const MEDIA_LABELS = {
+    image: '[תמונה]', video: '[סרטון]', audio: '[הודעה קולית]',
+    document: '[קובץ]', sticker: '[מדבקה]', ptt: '[הודעה קולית]'
+  };
+
+  console.log(`Starting chat import for org ${orgId}...`);
+  let allChats;
+  try {
+    allChats = await client.getChats();
+  } catch (err) {
+    console.error(`Failed to get chats for org ${orgId}:`, err.message);
+    return;
+  }
+
+  // Filter to 1:1 chats only, sort by most recent, limit
+  const chats = allChats
+    .filter(c => !c.isGroup && c.id?._serialized?.endsWith('@c.us'))
+    .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
+    .slice(0, MAX_CHATS);
+
+  console.log(`Found ${chats.length} 1:1 chats to import (of ${allChats.length} total)`);
+  let imported = 0;
+
+  for (const chat of chats) {
+    try {
+      const phone = chat.id._serialized.replace('@c.us', '');
+      const contactName = chat.name || phone;
+
+      // 1. Find or create contact
+      let { data: contact } = await supabase
+        .from('contacts')
+        .select('id')
+        .eq('organization_id', orgId)
+        .eq('phone', phone)
+        .single();
+
+      if (!contact) {
+        const { data: newContact } = await supabase
+          .from('contacts')
+          .insert({
+            organization_id: orgId,
+            name: contactName,
+            phone,
+            source_channel: 'whatsapp',
+            type: 'lead',
+            status: 'new'
+          })
+          .select()
+          .single();
+        contact = newContact;
+      }
+      if (!contact) continue;
+
+      // 2. Find or create conversation
+      let { data: conversation } = await supabase
+        .from('conversations')
+        .select('id')
+        .eq('organization_id', orgId)
+        .eq('contact_id', contact.id)
+        .eq('channel_id', channelId)
+        .single();
+
+      if (!conversation) {
+        const { data: newConv } = await supabase
+          .from('conversations')
+          .insert({
+            organization_id: orgId,
+            contact_id: contact.id,
+            channel_id: channelId,
+            channel_type: 'whatsapp',
+            external_chat_id: chat.id._serialized,
+            status: 'open'
+          })
+          .select()
+          .single();
+        conversation = newConv;
+      }
+      if (!conversation) continue;
+
+      // 3. Check if conversation already has messages (skip re-import)
+      const { count } = await supabase
+        .from('messages')
+        .select('id', { count: 'exact', head: true })
+        .eq('conversation_id', conversation.id);
+
+      if (count && count > 0) continue;
+
+      // 4. Fetch last N messages from this chat
+      let messages;
+      try {
+        messages = await chat.fetchMessages({ limit: MSGS_PER_CHAT });
+      } catch {
+        continue;
+      }
+      if (!messages || messages.length === 0) continue;
+
+      // 5. Insert messages in chronological order
+      const rows = messages.map(msg => {
+        const direction = msg.fromMe ? 'out' : 'in';
+        const type = msg.hasMedia
+          ? (msg.type === 'image' || msg.type === 'sticker' ? 'image'
+            : msg.type === 'video' ? 'video'
+            : msg.type === 'ptt' || msg.type === 'audio' ? 'audio'
+            : 'document')
+          : 'text';
+        const content = msg.body || MEDIA_LABELS[msg.type] || MEDIA_LABELS[type] || '';
+        const createdAt = msg.timestamp
+          ? new Date(msg.timestamp * 1000).toISOString()
+          : new Date().toISOString();
+
+        return {
+          conversation_id: conversation.id,
+          organization_id: orgId,
+          external_message_id: msg.id?._serialized || null,
+          direction,
+          type,
+          content,
+          is_read: true,
+          created_at: createdAt
+        };
+      });
+
+      await supabase.from('messages').insert(rows);
+
+      // 6. Update conversation with last message info
+      const lastMsg = rows[rows.length - 1];
+      await supabase
+        .from('conversations')
+        .update({
+          last_message_at: lastMsg.created_at,
+          last_message_text: lastMsg.content || `[${lastMsg.type}]`,
+          unread_count: 0
+        })
+        .eq('id', conversation.id);
+
+      imported++;
+    } catch (err) {
+      console.error(`Failed to import chat ${chat.id?._serialized}:`, err.message);
+    }
+  }
+
+  console.log(`Chat import complete for org ${orgId}: ${imported} conversations imported`);
 }
 
 /**
