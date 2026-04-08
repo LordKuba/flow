@@ -66,6 +66,7 @@ app.use('/api/notifications', notificationsRoutes);
 app.use('/api/org', orgRoutes);
 app.use('/api/stats', statsRoutes);
 app.use('/webhooks', webhooksRoutes);
+app.use('/api/channels/greenapi', require('./routes/greenapi'));
 
 // Realtime config — tells the frontend which channel to subscribe to
 // and provides the public (anon) key for the Supabase Realtime connection
@@ -104,24 +105,6 @@ app.get('/health', async (req, res) => {
   });
 });
 
-// WhatsApp/Chromium diagnostic — check if Puppeteer can launch
-app.get('/health/whatsapp', async (req, res) => {
-  const execPath = process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium';
-  try {
-    // Use puppeteer bundled with whatsapp-web.js
-    const puppeteer = require('puppeteer');
-    const browser = await puppeteer.launch({
-      headless: 'new',
-      executablePath: execPath,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--no-zygote']
-    });
-    const version = await browser.version();
-    await browser.close();
-    res.json({ status: 'ok', chromium: version, executablePath: execPath });
-  } catch (err) {
-    res.status(500).json({ status: 'error', error: err.message, executablePath: execPath });
-  }
-});
 
 // 404 handler
 app.use((req, res) => {
@@ -139,31 +122,29 @@ app.listen(PORT, () => {
   // Start reminder scheduler
   require('./services/reminderScheduler').start();
 
-  // Auto-reconnect WhatsApp sessions that were connected before deploy
+  // Auto-start Green API polling for connected channels
   (async () => {
     try {
       const { supabase: db } = require('./config/supabase');
-      const whatsapp = require('./services/whatsapp');
+      const greenapi = require('./services/greenapi');
 
       const { data: channels } = await db
         .from('channels')
-        .select('id, organization_id')
-        .eq('type', 'whatsapp_qr')
+        .select('id, organization_id, session_data')
+        .eq('type', 'whatsapp_greenapi')
         .eq('status', 'connected');
 
       if (channels && channels.length > 0) {
         for (const ch of channels) {
-          console.log(`Auto-reconnecting WhatsApp for org ${ch.organization_id}...`);
-          whatsapp.initSession(ch.organization_id, ch.id).catch(async (err) => {
-            console.error(`Auto-reconnect failed for org ${ch.organization_id}:`, err.message);
-            // Mark as disconnected so user can reconnect via QR
-            await db.from('channels').update({ status: 'disconnected' }).eq('id', ch.id);
-            console.log(`Channel ${ch.id} marked as disconnected after failed auto-reconnect`);
-          });
+          const creds = await greenapi.getCredentials(ch.organization_id);
+          if (creds) {
+            console.log(`Auto-starting Green API polling for org ${ch.organization_id}...`);
+            greenapi.startWebhookPolling(ch.organization_id, ch.id, creds.idInstance, creds.apiTokenInstance);
+          }
         }
       }
     } catch (err) {
-      console.error('Auto-reconnect error:', err.message);
+      console.error('Green API auto-start error:', err.message);
     }
   })();
 });

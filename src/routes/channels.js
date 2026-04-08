@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { supabase } = require('../config/supabase');
 const { authenticateUser, requireRole } = require('../middleware/auth');
-const whatsapp = require('../services/whatsapp');
+const greenapi = require('../services/greenapi');
 
 // All routes require authentication
 router.use(authenticateUser);
@@ -78,7 +78,7 @@ router.post('/whatsapp/qr', requireRole('main'), async (req, res) => {
     }
 
     // Initialize WhatsApp session
-    const result = await whatsapp.initSession(orgId, channelId);
+    return res.status(410).json({ error: 'WhatsApp QR deprecated. Use Green API: POST /api/channels/greenapi/connect' });
 
     res.json({
       channel_id: channelId,
@@ -97,7 +97,7 @@ router.post('/whatsapp/qr', requireRole('main'), async (req, res) => {
 router.get('/whatsapp/qr/status', async (req, res) => {
   try {
     const orgId = req.user.organization_id;
-    const session = whatsapp.getSession(orgId);
+    const session = null; // Old whatsapp-web.js session no longer available
 
     // Get channel info from DB
     const { data: channel } = await supabase
@@ -153,7 +153,7 @@ router.delete('/:channelId', requireRole('main'), async (req, res) => {
 
     // If WhatsApp QR, destroy the session
     if (channel.type === 'whatsapp_qr') {
-      await whatsapp.destroySession(orgId);
+      greenapi.stopPolling(orgId);
     }
 
     // Update channel status
@@ -262,7 +262,7 @@ router.post('/whatsapp/send', async (req, res) => {
       return res.status(400).json({ error: 'Phone and content/media_url are required' });
     }
 
-    await whatsapp.sendMessage(orgId, phone, content, media_url);
+    await greenapi.sendMessage(orgId, phone, content);
     res.json({ message: 'Message sent' });
   } catch (err) {
     console.error('WhatsApp send error:', err);

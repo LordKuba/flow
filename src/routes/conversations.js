@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { supabase } = require('../config/supabase');
 const { authenticateUser, requireRole, requireOwnConversation } = require('../middleware/auth');
-const whatsapp = require('../services/whatsapp');
+const greenapi = require('../services/greenapi');
 const { broadcastNewMessage, broadcastConversationAssigned } = require('../services/realtime');
 
 // All routes require authentication
@@ -195,88 +195,9 @@ router.post('/:id/sync-history', requireOwnConversation(), async (req, res) => {
       return res.json({ messages: existing || [], synced: false });
     }
 
-    // 3. Get WhatsApp session
-    const session = whatsapp.getSession(orgId);
-    if (!session || session.status !== 'ready') {
-      return res.status(400).json({ error: 'WhatsApp not connected' });
-    }
-
-    // 4. Fetch messages from WhatsApp via Store (pupPage.evaluate)
-    const chatId = conversation.external_chat_id;
-    let rawMessages = [];
-    try {
-      rawMessages = await session.client.pupPage.evaluate((cid) => {
-        const chat = window.Store?.Chat?.get(cid);
-        if (!chat || !chat.msgs) return [];
-        return chat.msgs.getModelsArray().slice(-20).map(m => ({
-          id: m.id?._serialized || '',
-          fromMe: m.id?.fromMe || false,
-          body: m.body || '',
-          type: m.type || 'chat',
-          timestamp: m.t || 0,
-          hasMedia: !!m.mediaData?.type
-        }));
-      }, chatId);
-    } catch (err) {
-      return res.status(500).json({ error: `Failed to read WhatsApp messages: ${err.message}` });
-    }
-
-    if (!rawMessages || rawMessages.length === 0) {
-      return res.json({ messages: [], synced: true });
-    }
-
-    // 5. Insert messages to DB
-    const MEDIA_LABELS = {
-      image: '[תמונה]', video: '[סרטון]', audio: '[הודעה קולית]',
-      document: '[קובץ]', sticker: '[מדבקה]', ptt: '[הודעה קולית]'
-    };
-
-    const rows = rawMessages.map(msg => {
-      const direction = msg.fromMe ? 'out' : 'in';
-      const type = msg.hasMedia
-        ? (msg.type === 'image' || msg.type === 'sticker' ? 'image'
-          : msg.type === 'video' ? 'video'
-          : msg.type === 'ptt' || msg.type === 'audio' ? 'audio'
-          : 'document')
-        : 'text';
-      const content = msg.body || MEDIA_LABELS[msg.type] || MEDIA_LABELS[type] || '';
-      const createdAt = msg.timestamp
-        ? new Date(msg.timestamp * 1000).toISOString()
-        : new Date().toISOString();
-
-      return {
-        conversation_id: conversationId,
-        organization_id: orgId,
-        external_message_id: msg.id || null,
-        direction,
-        type,
-        content,
-        is_read: true,
-        created_at: createdAt
-      };
-    });
-
-    await supabase.from('messages').insert(rows);
-
-    // 6. Update conversation with last message
-    const lastMsg = rows[rows.length - 1];
-    await supabase
-      .from('conversations')
-      .update({
-        last_message_at: lastMsg.created_at,
-        last_message_text: lastMsg.content || `[${lastMsg.type}]`,
-      })
-      .eq('id', conversationId);
-
-    // 7. Return the inserted messages
-    const { data: inserted } = await supabase
-      .from('messages')
-      .select('*')
-      .eq('conversation_id', conversationId)
-      .eq('organization_id', orgId)
-      .order('created_at', { ascending: true });
-
-    res.json({ messages: inserted || [], synced: true });
+    // Green API doesn't support fetching old message history.
+    // New messages arrive via webhook polling and are saved to DB in real-time.
+    res.json({ messages: [], synced: true });
   } catch (err) {
     console.error('Sync history error:', err);
     res.status(500).json({ error: 'Failed to sync history' });
@@ -335,7 +256,7 @@ router.post('/:id/messages', requireOwnConversation(), async (req, res) => {
     // Return response immediately — don't wait for WhatsApp send
     res.status(201).json(message);
 
-    // Send via WhatsApp in background (non-blocking)
+    // Send via WhatsApp (Green API) in background (non-blocking)
     if (conversation.channel_type === 'whatsapp') {
       (async () => {
         try {
@@ -346,7 +267,7 @@ router.post('/:id/messages', requireOwnConversation(), async (req, res) => {
             .single();
 
           if (contactData?.phone) {
-            await whatsapp.sendMessage(req.user.organization_id, contactData.phone, content, media_url);
+            await greenapi.sendMessage(req.user.organization_id, contactData.phone, content);
           }
         } catch (sendErr) {
           console.error('WhatsApp send error:', sendErr.message);
