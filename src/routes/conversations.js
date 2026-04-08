@@ -201,16 +201,27 @@ router.post('/:id/sync-history', requireOwnConversation(), async (req, res) => {
       return res.status(400).json({ error: 'WhatsApp not connected' });
     }
 
-    // 4. Fetch chat and messages from WhatsApp
-    let waMessages = [];
+    // 4. Fetch messages from WhatsApp via Store (pupPage.evaluate)
+    const chatId = conversation.external_chat_id;
+    let rawMessages = [];
     try {
-      const chat = await session.client.getChatById(conversation.external_chat_id);
-      waMessages = await chat.fetchMessages({ limit: 20 });
+      rawMessages = await session.client.pupPage.evaluate((cid) => {
+        const chat = window.Store?.Chat?.get(cid);
+        if (!chat || !chat.msgs) return [];
+        return chat.msgs.getModelsArray().slice(-20).map(m => ({
+          id: m.id?._serialized || '',
+          fromMe: m.id?.fromMe || false,
+          body: m.body || '',
+          type: m.type || 'chat',
+          timestamp: m.t || 0,
+          hasMedia: !!m.mediaData?.type
+        }));
+      }, chatId);
     } catch (err) {
-      return res.status(500).json({ error: `Failed to fetch WhatsApp messages: ${err.message}` });
+      return res.status(500).json({ error: `Failed to read WhatsApp messages: ${err.message}` });
     }
 
-    if (!waMessages || waMessages.length === 0) {
+    if (!rawMessages || rawMessages.length === 0) {
       return res.json({ messages: [], synced: true });
     }
 
@@ -220,7 +231,7 @@ router.post('/:id/sync-history', requireOwnConversation(), async (req, res) => {
       document: '[קובץ]', sticker: '[מדבקה]', ptt: '[הודעה קולית]'
     };
 
-    const rows = waMessages.map(msg => {
+    const rows = rawMessages.map(msg => {
       const direction = msg.fromMe ? 'out' : 'in';
       const type = msg.hasMedia
         ? (msg.type === 'image' || msg.type === 'sticker' ? 'image'
@@ -236,7 +247,7 @@ router.post('/:id/sync-history', requireOwnConversation(), async (req, res) => {
       return {
         conversation_id: conversationId,
         organization_id: orgId,
-        external_message_id: msg.id?._serialized || null,
+        external_message_id: msg.id || null,
         direction,
         type,
         content,
