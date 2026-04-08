@@ -341,130 +341,82 @@ async function handleIncomingMessage(orgId, channelId, msg) {
 }
 
 /**
- * Wraps client.getChats() with a timeout to prevent infinite hangs.
- */
-async function getChatsSafe(client, timeoutMs) {
-  return Promise.race([
-    client.getChats(),
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`getChats timed out after ${timeoutMs}ms`)), timeoutMs)
-    )
-  ]);
-}
-
-/**
- * Fallback: collect chats from 'chat' events over a time window.
- * whatsapp-web.js fires 'chat' for each chat as WhatsApp Web syncs.
- */
-function collectChatsFromEvents(client, windowMs) {
-  return new Promise((resolve) => {
-    const chats = new Map();
-    const handler = (chat) => chats.set(chat.id._serialized, chat);
-    client.on('chat', handler);
-    setTimeout(() => {
-      client.off('chat', handler);
-      resolve([...chats.values()]);
-    }, windowMs);
-  });
-}
-
-/**
- * Import existing WhatsApp chats after QR scan so the Inbox isn't empty.
- * Uses batched processing with real-time progress updates.
+ * Sync WhatsApp contacts to Inbox after QR scan.
+ * Uses pupPage.evaluate() to read chat metadata directly from WhatsApp's
+ * internal store — fast, no timeout, no message history fetching.
+ * New messages arrive via the existing 'message' event handler in real-time.
  */
 async function importExistingChats(client, orgId, channelId) {
-  const MSGS_PER_CHAT = 15;
   const BATCH_SIZE = 20;
-  const BATCH_DELAY_MS = 500;
-
-  const MEDIA_LABELS = {
-    image: '[תמונה]', video: '[סרטון]', audio: '[הודעה קולית]',
-    document: '[קובץ]', sticker: '[מדבקה]', ptt: '[הודעה קולית]'
-  };
+  const BATCH_DELAY_MS = 300;
 
   let imported = 0;
   let total = 0;
 
   try {
-    // ── Phase 1: Get chat list with 3-tier fallback ──
-    console.log(`Waiting 10s for WhatsApp to sync chats for org ${orgId}...`);
-    await new Promise(r => setTimeout(r, 10000));
+    // Wait for WhatsApp to finish initial sync
+    console.log(`Waiting 8s for WhatsApp to sync for org ${orgId}...`);
+    await new Promise(r => setTimeout(r, 8000));
 
-    let allChats = null;
+    // Read chat list directly from WhatsApp's internal store (fast, no timeout)
+    console.log(`Reading chat store for org ${orgId}...`);
+    const rawChats = await client.pupPage.evaluate(() => {
+      const store = window.Store?.Chat;
+      if (!store) return [];
+      return store.getModelsArray().map(c => ({
+        id: c.id._serialized,
+        name: c.name || c.formattedTitle || c.id.user,
+        lastMessage: c.lastReceivedKey?.fromMe
+          ? (c.msgs?.last?.body || '')
+          : (c.msgs?.last?.body || ''),
+        timestamp: c.t || 0,
+        unreadCount: c.unreadCount || 0
+      }));
+    });
 
-    // Attempt 1: getChats with 60s timeout
-    try {
-      console.log(`Fetching chats for org ${orgId} (60s timeout)...`);
-      allChats = await getChatsSafe(client, 60000);
-    } catch (err) {
-      console.warn(`First getChats attempt failed for org ${orgId}: ${err.message}`);
-    }
-
-    // Attempt 2: retry after 5s
-    if (!allChats) {
-      console.log(`Retrying getChats in 5s for org ${orgId}...`);
-      await new Promise(r => setTimeout(r, 5000));
-      try {
-        allChats = await getChatsSafe(client, 60000);
-      } catch (err2) {
-        console.warn(`Second getChats attempt failed for org ${orgId}: ${err2.message}`);
-      }
-    }
-
-    // Attempt 3: fallback to event collection
-    if (!allChats) {
-      console.log(`Falling back to chat event collection for org ${orgId} (45s window)...`);
-      broadcastChatImportProgress(orgId, {
-        status: 'importing', imported: 0, total: 0,
-        message: 'חשבון גדול — אוסף שיחות בדרך חלופית...'
-      });
-      allChats = await collectChatsFromEvents(client, 45000);
-      console.log(`Collected ${allChats.length} chats via events for org ${orgId}`);
-    }
-
-    if (!allChats || allChats.length === 0) {
-      console.log(`No chats found for org ${orgId}`);
+    if (!rawChats || rawChats.length === 0) {
+      console.log(`No chats in store for org ${orgId}`);
       broadcastChatImportProgress(orgId, {
         status: 'complete', imported: 0, total: 0,
-        message: 'לא נמצאו שיחות לייבוא'
+        message: 'לא נמצאו שיחות'
       });
       return;
     }
 
-    // ── Phase 2: Filter, sort, limit ──
-    const filtered = allChats
-      .filter(c => c.id?._serialized?.endsWith('@c.us'))
+    // Filter to 1:1 chats, sort by recent, limit to 50
+    const chats = rawChats
+      .filter(c => c.id.endsWith('@c.us'))
       .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
       .slice(0, 50);
 
-    total = filtered.length;
-    console.log(`Found ${total} 1:1 chats to import (of ${allChats.length} total) for org ${orgId}`);
+    total = chats.length;
+    console.log(`Found ${total} contacts to sync (of ${rawChats.length} total) for org ${orgId}`);
 
     if (total === 0) {
       broadcastChatImportProgress(orgId, {
         status: 'complete', imported: 0, total: 0,
-        message: 'לא נמצאו שיחות 1:1 לייבוא'
+        message: 'לא נמצאו שיחות 1:1'
       });
       return;
     }
 
     broadcastChatImportProgress(orgId, {
       status: 'importing', imported: 0, total,
-      message: `מתחיל ייבוא ${total} שיחות...`
+      message: `מסנכרן ${total} אנשי קשר...`
     });
 
-    // ── Phase 3: Process in batches ──
+    // Process in batches
     const totalBatches = Math.ceil(total / BATCH_SIZE);
 
     for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
       const start = batchIdx * BATCH_SIZE;
       const end = Math.min(start + BATCH_SIZE, total);
-      const batch = filtered.slice(start, end);
-      console.log(`Processing batch ${batchIdx + 1}/${totalBatches} (chats ${start + 1}-${end}) for org ${orgId}`);
+      const batch = chats.slice(start, end);
+      console.log(`Syncing batch ${batchIdx + 1}/${totalBatches} (contacts ${start + 1}-${end}) for org ${orgId}`);
 
       for (const chat of batch) {
         try {
-          const phone = chat.id._serialized.replace('@c.us', '');
+          const phone = chat.id.replace('@c.us', '');
           const contactName = chat.name || phone;
 
           // 1. Find or create contact
@@ -509,7 +461,7 @@ async function importExistingChats(client, orgId, channelId) {
                 contact_id: contact.id,
                 channel_id: channelId,
                 channel_type: 'whatsapp',
-                external_chat_id: chat.id._serialized,
+                external_chat_id: chat.id,
                 status: 'open'
               })
               .select()
@@ -518,72 +470,30 @@ async function importExistingChats(client, orgId, channelId) {
           }
           if (!conversation) continue;
 
-          // 3. Check if conversation already has messages (skip re-import)
-          const { count } = await supabase
-            .from('messages')
-            .select('id', { count: 'exact', head: true })
-            .eq('conversation_id', conversation.id);
+          // 3. Update conversation with last message preview (no message rows)
+          const lastMsgTime = chat.timestamp
+            ? new Date(chat.timestamp * 1000).toISOString()
+            : new Date().toISOString();
 
-          if (count && count > 0) continue;
-
-          // 4. Fetch last N messages from this chat
-          let messages;
-          try {
-            messages = await chat.fetchMessages({ limit: MSGS_PER_CHAT });
-          } catch {
-            continue;
-          }
-          if (!messages || messages.length === 0) continue;
-
-          // 5. Insert messages in chronological order
-          const rows = messages.map(msg => {
-            const direction = msg.fromMe ? 'out' : 'in';
-            const type = msg.hasMedia
-              ? (msg.type === 'image' || msg.type === 'sticker' ? 'image'
-                : msg.type === 'video' ? 'video'
-                : msg.type === 'ptt' || msg.type === 'audio' ? 'audio'
-                : 'document')
-              : 'text';
-            const content = msg.body || MEDIA_LABELS[msg.type] || MEDIA_LABELS[type] || '';
-            const createdAt = msg.timestamp
-              ? new Date(msg.timestamp * 1000).toISOString()
-              : new Date().toISOString();
-
-            return {
-              conversation_id: conversation.id,
-              organization_id: orgId,
-              external_message_id: msg.id?._serialized || null,
-              direction,
-              type,
-              content,
-              is_read: true,
-              created_at: createdAt
-            };
-          });
-
-          await supabase.from('messages').insert(rows);
-
-          // 6. Update conversation with last message info
-          const lastMsg = rows[rows.length - 1];
           await supabase
             .from('conversations')
             .update({
-              last_message_at: lastMsg.created_at,
-              last_message_text: lastMsg.content || `[${lastMsg.type}]`,
-              unread_count: 0
+              last_message_at: lastMsgTime,
+              last_message_text: chat.lastMessage || '',
+              unread_count: chat.unreadCount || 0
             })
             .eq('id', conversation.id);
 
           imported++;
         } catch (err) {
-          console.error(`Failed to import chat ${chat.id?._serialized}:`, err.message);
+          console.error(`Failed to sync chat ${chat.id}:`, err.message);
         }
       }
 
       // Broadcast progress after each batch
       broadcastChatImportProgress(orgId, {
         status: 'importing', imported, total,
-        message: `יובאו ${imported} מתוך ${total} שיחות...`
+        message: `סונכרנו ${imported} מתוך ${total} אנשי קשר...`
       });
 
       // Delay between batches
@@ -592,18 +502,18 @@ async function importExistingChats(client, orgId, channelId) {
       }
     }
 
-    // ── Phase 4: Complete ──
-    console.log(`Chat import complete for org ${orgId}: ${imported} conversations imported`);
+    // Done
+    console.log(`Contact sync complete for org ${orgId}: ${imported} contacts synced`);
     broadcastChatImportProgress(orgId, {
       status: 'complete', imported, total,
-      message: `ייבוא הושלם! ${imported} שיחות יובאו`
+      message: `סנכרון הושלם! ${imported} אנשי קשר`
     });
 
   } catch (err) {
     console.error(`importExistingChats failed for org ${orgId}:`, err.message);
     broadcastChatImportProgress(orgId, {
       status: 'error', imported, total: total || 0,
-      message: `שגיאה בייבוא: ${err.message}`
+      message: `שגיאה בסנכרון: ${err.message}`
     });
   }
 }
