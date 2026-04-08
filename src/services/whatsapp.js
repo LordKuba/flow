@@ -361,26 +361,20 @@ async function importExistingChats(client, orgId, channelId) {
     // Read chat list directly from WhatsApp's internal store
     console.log(`Reading chat store for org ${orgId}...`);
 
-    // Wait for Store to be available (polls every 500ms, max 30s)
-    const storeReady = await client.pupPage.evaluate(() => {
-      return new Promise((resolve) => {
-        let tries = 0;
-        const check = () => {
-          tries++;
-          if (window.Store && window.Store.Chat) {
-            resolve(true);
-          } else if (tries > 60) {
-            resolve(false);
-          } else {
-            setTimeout(check, 500);
-          }
-        };
-        check();
-      });
-    });
+    // Wait for Store.Chat to be available (Puppeteer waitForFunction, max 30s)
+    let storeReady = false;
+    try {
+      await client.pupPage.waitForFunction(
+        () => window.Store && window.Store.Chat && window.Store.Chat.getModelsArray,
+        { timeout: 30000, polling: 500 }
+      );
+      storeReady = true;
+      console.log(`Store.Chat ready for org ${orgId}`);
+    } catch (err) {
+      console.warn(`Store.Chat not available for org ${orgId} after 30s: ${err.message}`);
+    }
 
     if (!storeReady) {
-      console.warn(`Store.Chat not available for org ${orgId} after 30s`);
       broadcastChatImportProgress(orgId, {
         status: 'error', imported: 0, total: 0,
         message: 'WhatsApp Store לא זמין — נסה להתחבר מחדש'
@@ -388,7 +382,7 @@ async function importExistingChats(client, orgId, channelId) {
       return;
     }
 
-    console.log(`Store ready, extracting chats for org ${orgId}...`);
+    console.log(`Extracting chats for org ${orgId}...`);
     const rawChats = await client.pupPage.evaluate(() => {
       return window.Store.Chat.getModelsArray().map(c => ({
         id: c.id._serialized,
