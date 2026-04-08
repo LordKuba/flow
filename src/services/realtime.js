@@ -65,10 +65,19 @@ function broadcastEventReminder(orgId, { event }) {
   return broadcast(orgId, 'event_reminder', { event });
 }
 
+/**
+ * Chat import progress update.
+ * Frontend: show progress bar / toast during WhatsApp chat import.
+ */
+function broadcastChatImportProgress(orgId, { status, imported, total, message }) {
+  return broadcast(orgId, 'chat_import_progress', { status, imported, total, message });
+}
+
 module.exports = {
   broadcastNewMessage,
   broadcastConversationAssigned,
   broadcastNewTask,
   broadcastDocumentUpdated,
-  broadcastEventReminder
+  broadcastEventReminder,
+  broadcastChatImportProgress
 };

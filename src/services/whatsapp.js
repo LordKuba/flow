@@ -1,7 +1,7 @@
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode');
 const { supabase } = require('../config/supabase');
-const { broadcastNewMessage } = require('./realtime');
+const { broadcastNewMessage, broadcastChatImportProgress } = require('./realtime');
 const { notifyNewMessage } = require('./notifications');
 const { saveSession, restoreSession, clearSession } = require('./sessionStore');
 
@@ -341,169 +341,271 @@ async function handleIncomingMessage(orgId, channelId, msg) {
 }
 
 /**
+ * Wraps client.getChats() with a timeout to prevent infinite hangs.
+ */
+async function getChatsSafe(client, timeoutMs) {
+  return Promise.race([
+    client.getChats(),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`getChats timed out after ${timeoutMs}ms`)), timeoutMs)
+    )
+  ]);
+}
+
+/**
+ * Fallback: collect chats from 'chat' events over a time window.
+ * whatsapp-web.js fires 'chat' for each chat as WhatsApp Web syncs.
+ */
+function collectChatsFromEvents(client, windowMs) {
+  return new Promise((resolve) => {
+    const chats = new Map();
+    const handler = (chat) => chats.set(chat.id._serialized, chat);
+    client.on('chat', handler);
+    setTimeout(() => {
+      client.off('chat', handler);
+      resolve([...chats.values()]);
+    }, windowMs);
+  });
+}
+
+/**
  * Import existing WhatsApp chats after QR scan so the Inbox isn't empty.
- * Fetches up to 50 recent 1:1 chats and their last 15 messages each.
+ * Uses batched processing with real-time progress updates.
  */
 async function importExistingChats(client, orgId, channelId) {
-  const MAX_CHATS = 50;
   const MSGS_PER_CHAT = 15;
+  const BATCH_SIZE = 20;
+  const BATCH_DELAY_MS = 500;
 
   const MEDIA_LABELS = {
     image: '[תמונה]', video: '[סרטון]', audio: '[הודעה קולית]',
     document: '[קובץ]', sticker: '[מדבקה]', ptt: '[הודעה קולית]'
   };
 
-  // Wait for WhatsApp Web to fully sync chats before fetching
-  console.log(`Waiting 10s for WhatsApp to sync chats for org ${orgId}...`);
-  await new Promise(r => setTimeout(r, 10000));
+  let imported = 0;
+  let total = 0;
 
-  console.log(`Fetching chats for org ${orgId}...`);
-  let allChats;
   try {
-    allChats = await client.getChats();
-  } catch (err) {
-    console.error(`Failed to get chats for org ${orgId}: ${err.message}`);
-    // Retry once after 15s — WhatsApp may still be loading
-    console.log(`Retrying getChats in 15s for org ${orgId}...`);
-    await new Promise(r => setTimeout(r, 15000));
+    // ── Phase 1: Get chat list with 3-tier fallback ──
+    console.log(`Waiting 10s for WhatsApp to sync chats for org ${orgId}...`);
+    await new Promise(r => setTimeout(r, 10000));
+
+    let allChats = null;
+
+    // Attempt 1: getChats with 60s timeout
     try {
-      allChats = await client.getChats();
-    } catch (err2) {
-      console.error(`Retry also failed for org ${orgId}: ${err2.message}`);
+      console.log(`Fetching chats for org ${orgId} (60s timeout)...`);
+      allChats = await getChatsSafe(client, 60000);
+    } catch (err) {
+      console.warn(`First getChats attempt failed for org ${orgId}: ${err.message}`);
+    }
+
+    // Attempt 2: retry after 5s
+    if (!allChats) {
+      console.log(`Retrying getChats in 5s for org ${orgId}...`);
+      await new Promise(r => setTimeout(r, 5000));
+      try {
+        allChats = await getChatsSafe(client, 60000);
+      } catch (err2) {
+        console.warn(`Second getChats attempt failed for org ${orgId}: ${err2.message}`);
+      }
+    }
+
+    // Attempt 3: fallback to event collection
+    if (!allChats) {
+      console.log(`Falling back to chat event collection for org ${orgId} (45s window)...`);
+      broadcastChatImportProgress(orgId, {
+        status: 'importing', imported: 0, total: 0,
+        message: 'חשבון גדול — אוסף שיחות בדרך חלופית...'
+      });
+      allChats = await collectChatsFromEvents(client, 45000);
+      console.log(`Collected ${allChats.length} chats via events for org ${orgId}`);
+    }
+
+    if (!allChats || allChats.length === 0) {
+      console.log(`No chats found for org ${orgId}`);
+      broadcastChatImportProgress(orgId, {
+        status: 'complete', imported: 0, total: 0,
+        message: 'לא נמצאו שיחות לייבוא'
+      });
       return;
     }
-  }
 
-  // Filter to 1:1 chats only, sort by most recent, limit
-  const chats = allChats
-    .filter(c => !c.isGroup && c.id?._serialized?.endsWith('@c.us'))
-    .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
-    .slice(0, MAX_CHATS);
+    // ── Phase 2: Filter, sort, limit ──
+    const filtered = allChats
+      .filter(c => c.id?._serialized?.endsWith('@c.us'))
+      .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
+      .slice(0, 50);
 
-  console.log(`Found ${chats.length} 1:1 chats to import (of ${allChats.length} total)`);
-  let imported = 0;
+    total = filtered.length;
+    console.log(`Found ${total} 1:1 chats to import (of ${allChats.length} total) for org ${orgId}`);
 
-  for (let i = 0; i < chats.length; i++) {
-    const chat = chats[i];
-    try {
-      const phone = chat.id._serialized.replace('@c.us', '');
-      const contactName = chat.name || phone;
-      if (i % 10 === 0 && i > 0) console.log(`Chat import progress: ${i}/${chats.length} for org ${orgId}`);
+    if (total === 0) {
+      broadcastChatImportProgress(orgId, {
+        status: 'complete', imported: 0, total: 0,
+        message: 'לא נמצאו שיחות 1:1 לייבוא'
+      });
+      return;
+    }
 
-      // 1. Find or create contact
-      let { data: contact } = await supabase
-        .from('contacts')
-        .select('id')
-        .eq('organization_id', orgId)
-        .eq('phone', phone)
-        .single();
+    broadcastChatImportProgress(orgId, {
+      status: 'importing', imported: 0, total,
+      message: `מתחיל ייבוא ${total} שיחות...`
+    });
 
-      if (!contact) {
-        const { data: newContact } = await supabase
-          .from('contacts')
-          .insert({
-            organization_id: orgId,
-            name: contactName,
-            phone,
-            source_channel: 'whatsapp',
-            type: 'lead',
-            status: 'new'
-          })
-          .select()
-          .single();
-        contact = newContact;
+    // ── Phase 3: Process in batches ──
+    const totalBatches = Math.ceil(total / BATCH_SIZE);
+
+    for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
+      const start = batchIdx * BATCH_SIZE;
+      const end = Math.min(start + BATCH_SIZE, total);
+      const batch = filtered.slice(start, end);
+      console.log(`Processing batch ${batchIdx + 1}/${totalBatches} (chats ${start + 1}-${end}) for org ${orgId}`);
+
+      for (const chat of batch) {
+        try {
+          const phone = chat.id._serialized.replace('@c.us', '');
+          const contactName = chat.name || phone;
+
+          // 1. Find or create contact
+          let { data: contact } = await supabase
+            .from('contacts')
+            .select('id')
+            .eq('organization_id', orgId)
+            .eq('phone', phone)
+            .single();
+
+          if (!contact) {
+            const { data: newContact } = await supabase
+              .from('contacts')
+              .insert({
+                organization_id: orgId,
+                name: contactName,
+                phone,
+                source_channel: 'whatsapp',
+                type: 'lead',
+                status: 'new'
+              })
+              .select()
+              .single();
+            contact = newContact;
+          }
+          if (!contact) continue;
+
+          // 2. Find or create conversation
+          let { data: conversation } = await supabase
+            .from('conversations')
+            .select('id')
+            .eq('organization_id', orgId)
+            .eq('contact_id', contact.id)
+            .eq('channel_id', channelId)
+            .single();
+
+          if (!conversation) {
+            const { data: newConv } = await supabase
+              .from('conversations')
+              .insert({
+                organization_id: orgId,
+                contact_id: contact.id,
+                channel_id: channelId,
+                channel_type: 'whatsapp',
+                external_chat_id: chat.id._serialized,
+                status: 'open'
+              })
+              .select()
+              .single();
+            conversation = newConv;
+          }
+          if (!conversation) continue;
+
+          // 3. Check if conversation already has messages (skip re-import)
+          const { count } = await supabase
+            .from('messages')
+            .select('id', { count: 'exact', head: true })
+            .eq('conversation_id', conversation.id);
+
+          if (count && count > 0) continue;
+
+          // 4. Fetch last N messages from this chat
+          let messages;
+          try {
+            messages = await chat.fetchMessages({ limit: MSGS_PER_CHAT });
+          } catch {
+            continue;
+          }
+          if (!messages || messages.length === 0) continue;
+
+          // 5. Insert messages in chronological order
+          const rows = messages.map(msg => {
+            const direction = msg.fromMe ? 'out' : 'in';
+            const type = msg.hasMedia
+              ? (msg.type === 'image' || msg.type === 'sticker' ? 'image'
+                : msg.type === 'video' ? 'video'
+                : msg.type === 'ptt' || msg.type === 'audio' ? 'audio'
+                : 'document')
+              : 'text';
+            const content = msg.body || MEDIA_LABELS[msg.type] || MEDIA_LABELS[type] || '';
+            const createdAt = msg.timestamp
+              ? new Date(msg.timestamp * 1000).toISOString()
+              : new Date().toISOString();
+
+            return {
+              conversation_id: conversation.id,
+              organization_id: orgId,
+              external_message_id: msg.id?._serialized || null,
+              direction,
+              type,
+              content,
+              is_read: true,
+              created_at: createdAt
+            };
+          });
+
+          await supabase.from('messages').insert(rows);
+
+          // 6. Update conversation with last message info
+          const lastMsg = rows[rows.length - 1];
+          await supabase
+            .from('conversations')
+            .update({
+              last_message_at: lastMsg.created_at,
+              last_message_text: lastMsg.content || `[${lastMsg.type}]`,
+              unread_count: 0
+            })
+            .eq('id', conversation.id);
+
+          imported++;
+        } catch (err) {
+          console.error(`Failed to import chat ${chat.id?._serialized}:`, err.message);
+        }
       }
-      if (!contact) continue;
 
-      // 2. Find or create conversation
-      let { data: conversation } = await supabase
-        .from('conversations')
-        .select('id')
-        .eq('organization_id', orgId)
-        .eq('contact_id', contact.id)
-        .eq('channel_id', channelId)
-        .single();
-
-      if (!conversation) {
-        const { data: newConv } = await supabase
-          .from('conversations')
-          .insert({
-            organization_id: orgId,
-            contact_id: contact.id,
-            channel_id: channelId,
-            channel_type: 'whatsapp',
-            external_chat_id: chat.id._serialized,
-            status: 'open'
-          })
-          .select()
-          .single();
-        conversation = newConv;
-      }
-      if (!conversation) continue;
-
-      // 3. Check if conversation already has messages (skip re-import)
-      const { count } = await supabase
-        .from('messages')
-        .select('id', { count: 'exact', head: true })
-        .eq('conversation_id', conversation.id);
-
-      if (count && count > 0) continue;
-
-      // 4. Fetch last N messages from this chat
-      let messages;
-      try {
-        messages = await chat.fetchMessages({ limit: MSGS_PER_CHAT });
-      } catch {
-        continue;
-      }
-      if (!messages || messages.length === 0) continue;
-
-      // 5. Insert messages in chronological order
-      const rows = messages.map(msg => {
-        const direction = msg.fromMe ? 'out' : 'in';
-        const type = msg.hasMedia
-          ? (msg.type === 'image' || msg.type === 'sticker' ? 'image'
-            : msg.type === 'video' ? 'video'
-            : msg.type === 'ptt' || msg.type === 'audio' ? 'audio'
-            : 'document')
-          : 'text';
-        const content = msg.body || MEDIA_LABELS[msg.type] || MEDIA_LABELS[type] || '';
-        const createdAt = msg.timestamp
-          ? new Date(msg.timestamp * 1000).toISOString()
-          : new Date().toISOString();
-
-        return {
-          conversation_id: conversation.id,
-          organization_id: orgId,
-          external_message_id: msg.id?._serialized || null,
-          direction,
-          type,
-          content,
-          is_read: true,
-          created_at: createdAt
-        };
+      // Broadcast progress after each batch
+      broadcastChatImportProgress(orgId, {
+        status: 'importing', imported, total,
+        message: `יובאו ${imported} מתוך ${total} שיחות...`
       });
 
-      await supabase.from('messages').insert(rows);
-
-      // 6. Update conversation with last message info
-      const lastMsg = rows[rows.length - 1];
-      await supabase
-        .from('conversations')
-        .update({
-          last_message_at: lastMsg.created_at,
-          last_message_text: lastMsg.content || `[${lastMsg.type}]`,
-          unread_count: 0
-        })
-        .eq('id', conversation.id);
-
-      imported++;
-    } catch (err) {
-      console.error(`Failed to import chat ${chat.id?._serialized}:`, err.message);
+      // Delay between batches
+      if (batchIdx < totalBatches - 1) {
+        await new Promise(r => setTimeout(r, BATCH_DELAY_MS));
+      }
     }
-  }
 
-  console.log(`Chat import complete for org ${orgId}: ${imported} conversations imported`);
+    // ── Phase 4: Complete ──
+    console.log(`Chat import complete for org ${orgId}: ${imported} conversations imported`);
+    broadcastChatImportProgress(orgId, {
+      status: 'complete', imported, total,
+      message: `ייבוא הושלם! ${imported} שיחות יובאו`
+    });
+
+  } catch (err) {
+    console.error(`importExistingChats failed for org ${orgId}:`, err.message);
+    broadcastChatImportProgress(orgId, {
+      status: 'error', imported, total: total || 0,
+      message: `שגיאה בייבוא: ${err.message}`
+    });
+  }
 }
 
 /**

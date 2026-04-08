@@ -74,7 +74,7 @@ app.get('/api/realtime/config', require('./middleware/auth').authenticateUser, (
     supabase_url: process.env.SUPABASE_URL,
     supabase_anon_key: process.env.SUPABASE_ANON_KEY,
     channel: `org:${req.user.organization_id}`,
-    events: ['new_message', 'conversation_assigned', 'new_task', 'document_updated', 'event_reminder']
+    events: ['new_message', 'conversation_assigned', 'new_task', 'document_updated', 'event_reminder', 'chat_import_progress']
   });
 });
 
