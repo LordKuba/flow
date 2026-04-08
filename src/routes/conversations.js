@@ -11,7 +11,7 @@ router.use(authenticateUser);
 // GET /api/conversations — list conversations
 router.get('/', async (req, res) => {
   try {
-    const { status, channel_type, assigned_to, limit = 50, offset = 0 } = req.query;
+    const { status, channel_type, assigned_to, limit, offset = 0 } = req.query;
     const orgId = req.user.organization_id;
 
     let query = supabase
@@ -22,8 +22,11 @@ router.get('/', async (req, res) => {
         assigned_user:users!conversations_assigned_to_fkey(id, name, email)
       `, { count: 'exact' })
       .eq('organization_id', orgId)
-      .order('last_message_at', { ascending: false, nullsFirst: false })
-      .range(offset, offset + limit - 1);
+      .order('last_message_at', { ascending: false, nullsFirst: false });
+
+    if (limit) {
+      query = query.range(offset, offset + parseInt(limit) - 1);
+    }
 
     if (status) query = query.eq('status', status);
     if (channel_type) query = query.eq('channel_type', channel_type);
