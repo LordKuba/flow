@@ -160,6 +160,118 @@ router.get('/:id/messages', requireOwnConversation(), async (req, res) => {
   }
 });
 
+// POST /api/conversations/:id/sync-history — fetch history from WhatsApp on demand
+router.post('/:id/sync-history', requireOwnConversation(), async (req, res) => {
+  try {
+    const orgId = req.user.organization_id;
+    const conversationId = req.params.id;
+
+    // 1. Get conversation with external_chat_id
+    const { data: conversation, error: convError } = await supabase
+      .from('conversations')
+      .select('id, external_chat_id, channel_id')
+      .eq('id', conversationId)
+      .eq('organization_id', orgId)
+      .single();
+
+    if (convError || !conversation || !conversation.external_chat_id) {
+      return res.status(404).json({ error: 'Conversation not found or no WhatsApp chat linked' });
+    }
+
+    // 2. Check if already has messages (skip if so)
+    const { count } = await supabase
+      .from('messages')
+      .select('id', { count: 'exact', head: true })
+      .eq('conversation_id', conversationId);
+
+    if (count && count > 0) {
+      // Already has messages — just return them
+      const { data: existing } = await supabase
+        .from('messages')
+        .select('*')
+        .eq('conversation_id', conversationId)
+        .eq('organization_id', orgId)
+        .order('created_at', { ascending: true });
+      return res.json({ messages: existing || [], synced: false });
+    }
+
+    // 3. Get WhatsApp session
+    const session = whatsapp.getSession(orgId);
+    if (!session || session.status !== 'ready') {
+      return res.status(400).json({ error: 'WhatsApp not connected' });
+    }
+
+    // 4. Fetch chat and messages from WhatsApp
+    let waMessages = [];
+    try {
+      const chat = await session.client.getChatById(conversation.external_chat_id);
+      waMessages = await chat.fetchMessages({ limit: 20 });
+    } catch (err) {
+      return res.status(500).json({ error: `Failed to fetch WhatsApp messages: ${err.message}` });
+    }
+
+    if (!waMessages || waMessages.length === 0) {
+      return res.json({ messages: [], synced: true });
+    }
+
+    // 5. Insert messages to DB
+    const MEDIA_LABELS = {
+      image: '[תמונה]', video: '[סרטון]', audio: '[הודעה קולית]',
+      document: '[קובץ]', sticker: '[מדבקה]', ptt: '[הודעה קולית]'
+    };
+
+    const rows = waMessages.map(msg => {
+      const direction = msg.fromMe ? 'out' : 'in';
+      const type = msg.hasMedia
+        ? (msg.type === 'image' || msg.type === 'sticker' ? 'image'
+          : msg.type === 'video' ? 'video'
+          : msg.type === 'ptt' || msg.type === 'audio' ? 'audio'
+          : 'document')
+        : 'text';
+      const content = msg.body || MEDIA_LABELS[msg.type] || MEDIA_LABELS[type] || '';
+      const createdAt = msg.timestamp
+        ? new Date(msg.timestamp * 1000).toISOString()
+        : new Date().toISOString();
+
+      return {
+        conversation_id: conversationId,
+        organization_id: orgId,
+        external_message_id: msg.id?._serialized || null,
+        direction,
+        type,
+        content,
+        is_read: true,
+        created_at: createdAt
+      };
+    });
+
+    await supabase.from('messages').insert(rows);
+
+    // 6. Update conversation with last message
+    const lastMsg = rows[rows.length - 1];
+    await supabase
+      .from('conversations')
+      .update({
+        last_message_at: lastMsg.created_at,
+        last_message_text: lastMsg.content || `[${lastMsg.type}]`,
+      })
+      .eq('id', conversationId);
+
+    // 7. Return the inserted messages
+    const { data: inserted } = await supabase
+      .from('messages')
+      .select('*')
+      .eq('conversation_id', conversationId)
+      .eq('organization_id', orgId)
+      .order('created_at', { ascending: true });
+
+    res.json({ messages: inserted || [], synced: true });
+  } catch (err) {
+    console.error('Sync history error:', err);
+    res.status(500).json({ error: 'Failed to sync history' });
+  }
+});
+
 // POST /api/conversations/:id/messages — send a message
 router.post('/:id/messages', requireOwnConversation(), async (req, res) => {
   try {
