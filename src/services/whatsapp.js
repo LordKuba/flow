@@ -40,6 +40,7 @@ async function initSession(orgId, channelId) {
 
   const puppeteerConfig = {
     headless: 'new',
+    protocolTimeout: 600000, // 10 minutes — getChats() can be very slow on large accounts
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -352,13 +353,25 @@ async function importExistingChats(client, orgId, channelId) {
     document: '[קובץ]', sticker: '[מדבקה]', ptt: '[הודעה קולית]'
   };
 
-  console.log(`Starting chat import for org ${orgId}...`);
+  // Wait for WhatsApp Web to fully sync chats before fetching
+  console.log(`Waiting 10s for WhatsApp to sync chats for org ${orgId}...`);
+  await new Promise(r => setTimeout(r, 10000));
+
+  console.log(`Fetching chats for org ${orgId}...`);
   let allChats;
   try {
     allChats = await client.getChats();
   } catch (err) {
-    console.error(`Failed to get chats for org ${orgId}:`, err.message);
-    return;
+    console.error(`Failed to get chats for org ${orgId}: ${err.message}`);
+    // Retry once after 15s — WhatsApp may still be loading
+    console.log(`Retrying getChats in 15s for org ${orgId}...`);
+    await new Promise(r => setTimeout(r, 15000));
+    try {
+      allChats = await client.getChats();
+    } catch (err2) {
+      console.error(`Retry also failed for org ${orgId}: ${err2.message}`);
+      return;
+    }
   }
 
   // Filter to 1:1 chats only, sort by most recent, limit
@@ -370,10 +383,12 @@ async function importExistingChats(client, orgId, channelId) {
   console.log(`Found ${chats.length} 1:1 chats to import (of ${allChats.length} total)`);
   let imported = 0;
 
-  for (const chat of chats) {
+  for (let i = 0; i < chats.length; i++) {
+    const chat = chats[i];
     try {
       const phone = chat.id._serialized.replace('@c.us', '');
       const contactName = chat.name || phone;
+      if (i % 10 === 0 && i > 0) console.log(`Chat import progress: ${i}/${chats.length} for org ${orgId}`);
 
       // 1. Find or create contact
       let { data: contact } = await supabase
