@@ -475,6 +475,17 @@ async function importExistingChats(client, orgId, channelId) {
           }
           if (!contact) continue;
 
+          // 1b. Fetch profile picture (silent fail if private/blocked)
+          try {
+            const pfpUrl = await client.getProfilePicUrl(chat.id);
+            if (pfpUrl) {
+              await supabase
+                .from('contacts')
+                .update({ avatar_url: pfpUrl })
+                .eq('id', contact.id);
+            }
+          } catch {}
+
           // 2. Find or create conversation
           let { data: conversation } = await supabase
             .from('conversations')
