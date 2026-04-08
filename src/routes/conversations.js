@@ -332,32 +332,33 @@ router.post('/:id/messages', requireOwnConversation(), async (req, res) => {
       })
       .eq('id', req.params.id);
 
-    // Send via the appropriate channel
-    if (conversation.channel_type === 'whatsapp') {
-      try {
-        const { data: contactData } = await supabase
-          .from('contacts')
-          .select('phone')
-          .eq('id', conversation.contact_id)
-          .single();
+    // Return response immediately — don't wait for WhatsApp send
+    res.status(201).json(message);
 
-        if (contactData?.phone) {
-          await whatsapp.sendMessage(req.user.organization_id, contactData.phone, content, media_url);
+    // Send via WhatsApp in background (non-blocking)
+    if (conversation.channel_type === 'whatsapp') {
+      (async () => {
+        try {
+          const { data: contactData } = await supabase
+            .from('contacts')
+            .select('phone')
+            .eq('id', conversation.contact_id)
+            .single();
+
+          if (contactData?.phone) {
+            await whatsapp.sendMessage(req.user.organization_id, contactData.phone, content, media_url);
+          }
+        } catch (sendErr) {
+          console.error('WhatsApp send error:', sendErr.message);
         }
-      } catch (sendErr) {
-        console.error('WhatsApp send error:', sendErr);
-        // Message saved in DB even if send fails — can retry later
-      }
+      })();
     }
-    // TODO: Instagram, Facebook, Gmail sending in steps 11, 12
 
     // Broadcast new outgoing message to org
     broadcastNewMessage(req.user.organization_id, {
       message,
       conversation: { id: req.params.id, channel_type: conversation.channel_type }
     });
-
-    res.status(201).json(message);
   } catch (err) {
     console.error('Send message error:', err);
     res.status(500).json({ error: 'Failed to send message' });
