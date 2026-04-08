@@ -28,6 +28,15 @@ async function initSession(orgId, channelId) {
     return { status: 'qr_pending', qr: existing.qrDataUrl };
   }
 
+  // Clean up stale/errored session before creating new one
+  if (existing) {
+    console.log(`Cleaning up stale session (status: ${existing.status}) for org ${orgId}`);
+    if (existing.client) {
+      try { await existing.client.destroy(); } catch {}
+    }
+    sessions.delete(orgId);
+  }
+
   // Create new session state
   const sessionState = {
     status: 'initializing',

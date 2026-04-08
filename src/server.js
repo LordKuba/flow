@@ -154,8 +154,11 @@ app.listen(PORT, () => {
       if (channels && channels.length > 0) {
         for (const ch of channels) {
           console.log(`Auto-reconnecting WhatsApp for org ${ch.organization_id}...`);
-          whatsapp.initSession(ch.organization_id, ch.id).catch(err => {
+          whatsapp.initSession(ch.organization_id, ch.id).catch(async (err) => {
             console.error(`Auto-reconnect failed for org ${ch.organization_id}:`, err.message);
+            // Mark as disconnected so user can reconnect via QR
+            await db.from('channels').update({ status: 'disconnected' }).eq('id', ch.id);
+            console.log(`Channel ${ch.id} marked as disconnected after failed auto-reconnect`);
           });
         }
       }
