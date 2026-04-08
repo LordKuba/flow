@@ -408,26 +408,25 @@ async function importExistingChats(client, orgId, channelId) {
       return;
     }
 
-    // Filter to 1:1 chats, sort by recent, limit to 50
+    // Sort by recent activity, include all chats (1:1 + groups)
     const chats = rawChats
-      .filter(c => c.id.endsWith('@c.us'))
-      .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
-      .slice(0, 50);
+      .filter(c => c.id.endsWith('@c.us') || c.id.endsWith('@g.us'))
+      .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
 
     total = chats.length;
-    console.log(`Found ${total} contacts to sync (of ${rawChats.length} total) for org ${orgId}`);
+    console.log(`Found ${total} chats to sync (${rawChats.length} raw) for org ${orgId}`);
 
     if (total === 0) {
       broadcastChatImportProgress(orgId, {
         status: 'complete', imported: 0, total: 0,
-        message: 'לא נמצאו שיחות 1:1'
+        message: 'לא נמצאו שיחות'
       });
       return;
     }
 
     broadcastChatImportProgress(orgId, {
       status: 'importing', imported: 0, total,
-      message: `מסנכרן ${total} אנשי קשר...`
+      message: `מסנכרן ${total} שיחות...`
     });
 
     // Process in batches
@@ -441,7 +440,8 @@ async function importExistingChats(client, orgId, channelId) {
 
       for (const chat of batch) {
         try {
-          const phone = chat.id.replace('@c.us', '');
+          const isGroup = chat.id.endsWith('@g.us');
+          const phone = chat.id.replace('@c.us', '').replace('@g.us', '');
           const contactName = chat.name || phone;
 
           // 1. Find or create contact
