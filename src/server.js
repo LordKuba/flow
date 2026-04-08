@@ -138,6 +138,31 @@ app.listen(PORT, () => {
   console.log(`Flow Backend running on port ${PORT}`);
   // Start reminder scheduler
   require('./services/reminderScheduler').start();
+
+  // Auto-reconnect WhatsApp sessions that were connected before deploy
+  (async () => {
+    try {
+      const { supabase: db } = require('./config/supabase');
+      const whatsapp = require('./services/whatsapp');
+
+      const { data: channels } = await db
+        .from('channels')
+        .select('id, organization_id')
+        .eq('type', 'whatsapp_qr')
+        .eq('status', 'connected');
+
+      if (channels && channels.length > 0) {
+        for (const ch of channels) {
+          console.log(`Auto-reconnecting WhatsApp for org ${ch.organization_id}...`);
+          whatsapp.initSession(ch.organization_id, ch.id).catch(err => {
+            console.error(`Auto-reconnect failed for org ${ch.organization_id}:`, err.message);
+          });
+        }
+      }
+    } catch (err) {
+      console.error('Auto-reconnect error:', err.message);
+    }
+  })();
 });
 
 module.exports = app;
