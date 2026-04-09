@@ -95,7 +95,6 @@ router.get('/status', async (req, res) => {
       status: channel.status,
       phone_number: channel.phone_number,
       account_name: channel.account_name,
-      polling: greenapi.isPolling(orgId),
     };
 
     // Also check live instance status if credentials exist
@@ -114,12 +113,10 @@ router.get('/status', async (req, res) => {
   }
 });
 
-// DELETE /api/channels/greenapi/disconnect — stop polling, mark disconnected
+// DELETE /api/channels/greenapi/disconnect — mark disconnected
 router.delete('/disconnect', requireRole('main'), async (req, res) => {
   try {
     const orgId = req.user.organization_id;
-
-    greenapi.stopPolling(orgId);
 
     await supabase
       .from('channels')

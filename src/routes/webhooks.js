@@ -4,6 +4,8 @@ const crypto = require('crypto');
 const { supabase } = require('../config/supabase');
 const { broadcastNewMessage } = require('../services/realtime');
 const { notifyNewMessage } = require('../services/notifications');
+const { decrypt } = require('../services/encryption');
+const { processNotification: processGreenApiNotification } = require('../services/greenapi');
 
 // ─── WhatsApp webhook (whatsapp-web.js events are handled in-process)  ────────
 // This endpoint is for external WhatsApp Cloud API if ever migrated to Meta
@@ -182,6 +184,61 @@ router.post('/gmail', express.json(), async (req, res) => {
     // webhook handler fast; client should poll /api/channels/gmail/messages instead.
   } catch (err) {
     console.error('Gmail webhook error:', err);
+  }
+});
+
+// ─── Green API webhook ────────────────────────────────────────────────────────
+// No auth — Green API posts directly. We identify the channel by idInstance
+// from the notification body and route to the existing processNotification.
+// The body shape from a real webhook POST differs from the polling shape
+// (polling wraps in { receiptId, body: {...} }, webhook posts the inner object
+// directly), so we re-wrap to match what processNotification expects.
+router.post('/greenapi', express.json({ limit: '2mb' }), async (req, res) => {
+  // Acknowledge IMMEDIATELY — Green API retries if we're slow
+  res.sendStatus(200);
+
+  try {
+    const body = req.body;
+    if (!body) {
+      console.warn('[GreenAPI webhook] empty body');
+      return;
+    }
+
+    const idInstance = body?.instanceData?.idInstance;
+    if (!idInstance) {
+      console.warn('[GreenAPI webhook] no idInstance in body:', JSON.stringify(body).substring(0, 300));
+      return;
+    }
+
+    // Look up channel by idInstance (decrypt each session_data until we match)
+    const { data: channels } = await supabase
+      .from('channels')
+      .select('id, organization_id, session_data')
+      .eq('type', 'whatsapp_greenapi')
+      .not('session_data', 'is', null);
+
+    let match = null;
+    for (const ch of channels || []) {
+      try {
+        const creds = decrypt(ch.session_data);
+        if (creds && String(creds.idInstance) === String(idInstance)) {
+          match = { orgId: ch.organization_id, channelId: ch.id };
+          break;
+        }
+      } catch {}
+    }
+
+    if (!match) {
+      console.warn(`[GreenAPI webhook] no channel matches idInstance ${idInstance}`);
+      return;
+    }
+
+    console.log(`[GreenAPI webhook] ${body.typeWebhook} for org ${match.orgId}`);
+
+    // Wrap body so it matches what processNotification expects ({ body: <notification> })
+    await processGreenApiNotification(match.orgId, match.channelId, { body });
+  } catch (err) {
+    console.error('[GreenAPI webhook] error:', err.message);
   }
 });
 

@@ -151,11 +151,6 @@ router.delete('/:channelId', requireRole('main'), async (req, res) => {
       return res.status(404).json({ error: 'Channel not found' });
     }
 
-    // If WhatsApp QR, destroy the session
-    if (channel.type === 'whatsapp_qr') {
-      greenapi.stopPolling(orgId);
-    }
-
     // Update channel status
     await supabase
       .from('channels')

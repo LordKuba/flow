@@ -5,20 +5,15 @@ const { notifyNewMessage } = require('./notifications');
 
 const BASE_URL = 'https://api.green-api.com';
 
-// Active polling intervals per org
-const pollers = new Map();
-
 /**
  * Initialize Green API for an organization.
- * Saves encrypted credentials and starts webhook polling.
+ * Saves encrypted credentials and marks the channel connected.
+ * Incoming messages arrive via POST /webhooks/greenapi (no polling).
  */
 async function initGreenApi(orgId, channelId, idInstance, apiTokenInstance) {
   // Save encrypted credentials to channels.session_data
   const credentials = encrypt(JSON.stringify({ idInstance, apiTokenInstance }));
 
-  // Always mark as connected once credentials are saved.
-  // Polling will run regardless; stateInstance may still be notAuthorized
-  // if user hasn't scanned QR yet — that's fine.
   await supabase
     .from('channels')
     .update({
@@ -27,7 +22,7 @@ async function initGreenApi(orgId, channelId, idInstance, apiTokenInstance) {
     })
     .eq('id', channelId);
 
-  // Log instance state for debugging (don't gate on it)
+  // Log current state for debugging (don't gate on it)
   try {
     const statusRes = await fetch(
       `${BASE_URL}/waInstance${idInstance}/getStateInstance/${apiTokenInstance}`
@@ -37,9 +32,6 @@ async function initGreenApi(orgId, channelId, idInstance, apiTokenInstance) {
   } catch (err) {
     console.error(`[GreenAPI] Failed to check state at init:`, err.message);
   }
-
-  // Start polling for incoming messages — runs regardless of QR scan state
-  startWebhookPolling(orgId, channelId, idInstance, apiTokenInstance);
 
   return { status: 'connected', idInstance };
 }
@@ -93,80 +85,9 @@ async function sendMessage(orgId, phoneNumber, content) {
 }
 
 /**
- * Start polling for incoming webhooks (notifications).
- */
-function startWebhookPolling(orgId, channelId, idInstance, apiTokenInstance) {
-  // Stop existing poller if any
-  stopPolling(orgId);
-
-  console.log(`[GreenAPI] Starting polling for org ${orgId} (instance ${idInstance})`);
-
-  let pollCount = 0;
-  let lastLogTime = Date.now();
-
-  const poll = async () => {
-    pollCount++;
-    try {
-      // Receive one notification
-      const url = `${BASE_URL}/waInstance${idInstance}/receiveNotification/${apiTokenInstance}`;
-      const res = await fetch(url);
-
-      // Log every poll status once per 30s as a heartbeat
-      if (Date.now() - lastLogTime > 30000) {
-        console.log(`[GreenAPI] Heartbeat org ${orgId}: ${pollCount} polls done, last HTTP ${res.status}`);
-        lastLogTime = Date.now();
-      }
-
-      if (!res.ok) {
-        const text = await res.text().catch(() => '');
-        console.warn(`[GreenAPI] HTTP ${res.status} from receiveNotification for org ${orgId}: ${text.substring(0, 200)}`);
-        return;
-      }
-
-      const data = await res.json();
-
-      // Log whenever we actually get data (not null/empty)
-      if (data !== null && data !== undefined) {
-        console.log(`[GreenAPI] Received notification for org ${orgId}:`, JSON.stringify(data).substring(0, 500));
-      }
-
-      if (data && data.receiptId) {
-        // Process the notification
-        await processNotification(orgId, channelId, data);
-
-        // Delete it so we don't get it again
-        const delRes = await fetch(
-          `${BASE_URL}/waInstance${idInstance}/deleteNotification/${apiTokenInstance}/${data.receiptId}`,
-          { method: 'DELETE' }
-        );
-        console.log(`[GreenAPI] Deleted notification ${data.receiptId} for org ${orgId}, status ${delRes.status}`);
-      }
-    } catch (err) {
-      console.error(`[GreenAPI] Poll error for org ${orgId}: ${err.message}`);
-    }
-  };
-
-  const interval = setInterval(poll, 1000);
-  pollers.set(orgId, interval);
-
-  // Run first poll immediately
-  poll();
-}
-
-/**
- * Stop polling for an org.
- */
-function stopPolling(orgId) {
-  const existing = pollers.get(orgId);
-  if (existing) {
-    clearInterval(existing);
-    pollers.delete(orgId);
-    console.log(`Stopped Green API polling for org ${orgId}`);
-  }
-}
-
-/**
  * Process a single webhook notification.
+ * Called from the POST /webhooks/greenapi route (re-wrapped to { body })
+ * so the existing shape still works.
  */
 async function processNotification(orgId, channelId, notification) {
   const body = notification.body;
@@ -354,20 +275,11 @@ async function getCredentials(orgId) {
   }
 }
 
-/**
- * Check if polling is active for an org.
- */
-function isPolling(orgId) {
-  return pollers.has(orgId);
-}
-
 module.exports = {
   initGreenApi,
   getQR,
   getStatus,
   sendMessage,
-  startWebhookPolling,
-  stopPolling,
   getCredentials,
-  isPolling,
+  processNotification,
 };

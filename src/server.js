@@ -121,34 +121,8 @@ app.listen(PORT, () => {
   console.log(`Flow Backend running on port ${PORT}`);
   // Start reminder scheduler
   require('./services/reminderScheduler').start();
-
-  // Auto-start Green API polling for connected channels
-  (async () => {
-    try {
-      const { supabase: db } = require('./config/supabase');
-      const greenapi = require('./services/greenapi');
-
-      // Start polling for any Green API channel that has credentials,
-      // regardless of status — polling itself will detect QR/authorized state
-      const { data: channels } = await db
-        .from('channels')
-        .select('id, organization_id, session_data')
-        .eq('type', 'whatsapp_greenapi')
-        .not('session_data', 'is', null);
-
-      if (channels && channels.length > 0) {
-        for (const ch of channels) {
-          const creds = await greenapi.getCredentials(ch.organization_id);
-          if (creds) {
-            console.log(`Auto-starting Green API polling for org ${ch.organization_id}...`);
-            greenapi.startWebhookPolling(ch.organization_id, ch.id, creds.idInstance, creds.apiTokenInstance);
-          }
-        }
-      }
-    } catch (err) {
-      console.error('Green API auto-start error:', err.message);
-    }
-  })();
+  // Incoming WhatsApp messages arrive via POST /webhooks/greenapi
+  // (configured in the Green API console per instance) — no polling.
 });
 
 module.exports = app;
