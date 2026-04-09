@@ -128,11 +128,13 @@ app.listen(PORT, () => {
       const { supabase: db } = require('./config/supabase');
       const greenapi = require('./services/greenapi');
 
+      // Start polling for any Green API channel that has credentials,
+      // regardless of status — polling itself will detect QR/authorized state
       const { data: channels } = await db
         .from('channels')
         .select('id, organization_id, session_data')
         .eq('type', 'whatsapp_greenapi')
-        .eq('status', 'connected');
+        .not('session_data', 'is', null);
 
       if (channels && channels.length > 0) {
         for (const ch of channels) {

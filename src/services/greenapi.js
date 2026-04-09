@@ -16,6 +16,9 @@ async function initGreenApi(orgId, channelId, idInstance, apiTokenInstance) {
   // Save encrypted credentials to channels.session_data
   const credentials = encrypt(JSON.stringify({ idInstance, apiTokenInstance }));
 
+  // Always mark as connected once credentials are saved.
+  // Polling will run regardless; stateInstance may still be notAuthorized
+  // if user hasn't scanned QR yet — that's fine.
   await supabase
     .from('channels')
     .update({
@@ -24,24 +27,18 @@ async function initGreenApi(orgId, channelId, idInstance, apiTokenInstance) {
     })
     .eq('id', channelId);
 
-  // Check instance status
+  // Log instance state for debugging (don't gate on it)
   try {
     const statusRes = await fetch(
       `${BASE_URL}/waInstance${idInstance}/getStateInstance/${apiTokenInstance}`
     );
     const statusData = await statusRes.json();
-    console.log(`Green API instance ${idInstance} status:`, statusData.stateInstance);
-
-    if (statusData.stateInstance === 'authorized') {
-      await supabase.from('channels').update({ status: 'connected' }).eq('id', channelId);
-    } else {
-      await supabase.from('channels').update({ status: 'disconnected' }).eq('id', channelId);
-    }
+    console.log(`[GreenAPI] Instance ${idInstance} state at init: ${statusData.stateInstance}`);
   } catch (err) {
-    console.error(`Failed to check Green API status:`, err.message);
+    console.error(`[GreenAPI] Failed to check state at init:`, err.message);
   }
 
-  // Start polling for incoming messages
+  // Start polling for incoming messages — runs regardless of QR scan state
   startWebhookPolling(orgId, channelId, idInstance, apiTokenInstance);
 
   return { status: 'connected', idInstance };
@@ -190,7 +187,9 @@ async function processNotification(orgId, channelId, notification) {
   if (type === 'stateInstanceChanged') {
     const state = body.stateInstance;
     console.log(`[GreenAPI] Instance state changed for org ${orgId}: ${state}`);
-    if (state === 'notAuthorized' || state === 'blocked') {
+    if (state === 'authorized') {
+      await supabase.from('channels').update({ status: 'connected' }).eq('id', channelId);
+    } else if (state === 'notAuthorized' || state === 'blocked') {
       await supabase.from('channels').update({ status: 'disconnected' }).eq('id', channelId);
     }
   }
