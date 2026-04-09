@@ -102,31 +102,50 @@ function startWebhookPolling(orgId, channelId, idInstance, apiTokenInstance) {
   // Stop existing poller if any
   stopPolling(orgId);
 
-  console.log(`Starting Green API polling for org ${orgId} (instance ${idInstance})`);
+  console.log(`[GreenAPI] Starting polling for org ${orgId} (instance ${idInstance})`);
+
+  let pollCount = 0;
+  let lastLogTime = Date.now();
 
   const poll = async () => {
+    pollCount++;
     try {
       // Receive one notification
-      const res = await fetch(
-        `${BASE_URL}/waInstance${idInstance}/receiveNotification/${apiTokenInstance}`
-      );
+      const url = `${BASE_URL}/waInstance${idInstance}/receiveNotification/${apiTokenInstance}`;
+      const res = await fetch(url);
+
+      // Log every poll status once per 30s as a heartbeat
+      if (Date.now() - lastLogTime > 30000) {
+        console.log(`[GreenAPI] Heartbeat org ${orgId}: ${pollCount} polls done, last HTTP ${res.status}`);
+        lastLogTime = Date.now();
+      }
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        console.warn(`[GreenAPI] HTTP ${res.status} from receiveNotification for org ${orgId}: ${text.substring(0, 200)}`);
+        return;
+      }
+
       const data = await res.json();
+
+      // Log whenever we actually get data (not null/empty)
+      if (data !== null && data !== undefined) {
+        console.log(`[GreenAPI] Received notification for org ${orgId}:`, JSON.stringify(data).substring(0, 500));
+      }
 
       if (data && data.receiptId) {
         // Process the notification
         await processNotification(orgId, channelId, data);
 
         // Delete it so we don't get it again
-        await fetch(
+        const delRes = await fetch(
           `${BASE_URL}/waInstance${idInstance}/deleteNotification/${apiTokenInstance}/${data.receiptId}`,
           { method: 'DELETE' }
         );
+        console.log(`[GreenAPI] Deleted notification ${data.receiptId} for org ${orgId}, status ${delRes.status}`);
       }
     } catch (err) {
-      // Network errors are normal — just retry
-      if (!err.message?.includes('fetch failed')) {
-        console.error(`Green API poll error for org ${orgId}:`, err.message);
-      }
+      console.error(`[GreenAPI] Poll error for org ${orgId}: ${err.message}`);
     }
   };
 
@@ -154,9 +173,13 @@ function stopPolling(orgId) {
  */
 async function processNotification(orgId, channelId, notification) {
   const body = notification.body;
-  if (!body) return;
+  if (!body) {
+    console.log(`[GreenAPI] Notification has no body for org ${orgId}`);
+    return;
+  }
 
   const type = body.typeWebhook;
+  console.log(`[GreenAPI] Processing type=${type} for org ${orgId}`);
 
   // Only handle incoming messages
   if (type === 'incomingMessageReceived' || type === 'incomingMessageReceivedByEvent') {
@@ -166,7 +189,7 @@ async function processNotification(orgId, channelId, notification) {
   // Handle status changes
   if (type === 'stateInstanceChanged') {
     const state = body.stateInstance;
-    console.log(`Green API instance state changed for org ${orgId}: ${state}`);
+    console.log(`[GreenAPI] Instance state changed for org ${orgId}: ${state}`);
     if (state === 'notAuthorized' || state === 'blocked') {
       await supabase.from('channels').update({ status: 'disconnected' }).eq('id', channelId);
     }
